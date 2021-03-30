@@ -1,16 +1,22 @@
 package org.kryptonmc.krypton.api.command
 
 import net.kyori.adventure.audience.Audience
+import net.kyori.adventure.identity.Identified
 
 /**
  * A sender is an interface representing the sender of a command.
  */
-interface Sender : Audience {
+interface Sender : Audience, Identified {
 
     /**
      * The sender's name
      */
     val name: String
+
+    /**
+     * The sender's permissions
+     */
+    val permissions: Map<String, Boolean>
 
     /**
      * If the sender has the specified [permission]

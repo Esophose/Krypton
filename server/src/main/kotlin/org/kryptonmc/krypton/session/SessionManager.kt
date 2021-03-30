@@ -9,6 +9,7 @@ import net.kyori.adventure.extra.kotlin.translatable
 import net.kyori.adventure.text.format.NamedTextColor
 import org.kryptonmc.krypton.*
 import org.kryptonmc.krypton.api.event.events.login.JoinEvent
+import org.kryptonmc.krypton.api.event.events.play.QuitEvent
 import org.kryptonmc.krypton.api.registry.NamespacedKey
 import org.kryptonmc.krypton.api.space.Vector
 import org.kryptonmc.krypton.api.world.Gamemode
@@ -16,7 +17,7 @@ import org.kryptonmc.krypton.concurrent.NamedThreadFactory
 import org.kryptonmc.krypton.encryption.Encryption.Companion.SHARED_SECRET_ALGORITHM
 import org.kryptonmc.krypton.encryption.toDecryptingCipher
 import org.kryptonmc.krypton.encryption.toEncryptingCipher
-import org.kryptonmc.krypton.entity.Abilities
+import org.kryptonmc.krypton.api.entity.Abilities
 import org.kryptonmc.krypton.entity.metadata.PlayerMetadata
 import org.kryptonmc.krypton.extension.logger
 import org.kryptonmc.krypton.extension.toArea
@@ -53,25 +54,32 @@ class SessionManager(private val server: KryptonServer) {
 
     private val keepAliveExecutor = Executors.newScheduledThreadPool(8, NamedThreadFactory("Keep Alive Thread #%d"))
 
+    init {
+        Runtime.getRuntime().addShutdownHook(Thread { keepAliveExecutor.shutdown() })
+    }
+
     fun handle(session: Session, packet: Packet) = handler.handle(session, packet)
 
     fun beginPlayState(session: Session) {
         session.sendPacket(PacketOutLoginSuccess(session.profile.uuid, session.profile.name))
-        session.currentState = PacketState.PLAY
 
         val event = JoinEvent(session.player)
         server.eventBus.call(event)
         if (event.isCancelled) {
-            session.sendPacket(PacketOutDisconnect(translatable { key("multiplayer.disconnect.kicked") }))
+            session.sendPacket(PacketOutDisconnect(event.cancelledReason))
             session.disconnect()
             return
         }
 
         val world = server.worldManager.worlds.getValue(server.config.world.name)
         world.gamemode = server.config.world.gamemode
+        session.player.world = world
+
         session.player.gamemode = world.gamemode
         val spawnLocation = world.spawnLocation
         session.player.location = spawnLocation
+
+        session.currentState = PacketState.PLAY
 
         val joinPacket = PacketOutChat(
             translatable {
@@ -111,11 +119,15 @@ class SessionManager(private val server: KryptonServer) {
         session.sendPacket(PacketOutUnlockRecipes(UnlockRecipesAction.INIT))
         session.sendPacket(PacketOutPlayerPositionAndLook(session.player.location, teleportId = session.teleportId))
         session.sendPacket(joinPacket)
+        session.sendPacket(PacketOutPlayerInfo(
+            PlayerAction.UPDATE_LATENCY,
+            listOf(PlayerInfo(latency = session.latency, profile = session.profile))
+        ))
 
         val playerInfos = sessions.filter { it.currentState == PacketState.PLAY }.map {
             PlayerInfo(0, it.player.gamemode, it.profile, text { content(it.profile.name) })
         }
-        session.sendPacket(PacketOutPlayerInfo(PlayerAction.ADD_PLAYER, playerInfos))
+        if (playerInfos.isNotEmpty()) session.sendPacket(PacketOutPlayerInfo(PlayerAction.ADD_PLAYER, playerInfos))
 
         GlobalScope.launch(Dispatchers.IO) { handlePlayStateBegin(session, joinPacket) }
 
@@ -130,24 +142,18 @@ class SessionManager(private val server: KryptonServer) {
             }
 
         val centerChunk = Vector(floor(spawnLocation.x / 16.0), 0.0, floor(spawnLocation.z / 16.0))
-        val region = server.worldManager.loadRegionFromChunk(centerChunk)
 
         session.sendPacket(PacketOutUpdateViewPosition(centerChunk))
 
         GlobalScope.launch(Dispatchers.IO) {
-            var chunkRegion = region
-            for (i in 0 until server.config.world.viewDistance.toArea()) {
-                val chunkPosition = server.worldManager.chunkInSpiral(i, centerChunk.x, centerChunk.z)
+            val positionsToLoad = mutableListOf<Vector>()
+            repeat(server.config.world.viewDistance.toArea()) {
+                positionsToLoad += server.worldManager.chunkInSpiral(it, centerChunk.x, centerChunk.z)
+            }
 
-                val regionX = floor(chunkPosition.x / 32.0).toInt()
-                val regionZ = floor(chunkPosition.z / 32.0).toInt()
-                if (chunkRegion.x != regionX || chunkRegion.z != regionZ) {
-                    chunkRegion = server.worldManager.loadRegionFromChunk(chunkPosition)
-                }
-
-                val chunk = chunkRegion.chunks[chunkPosition] ?: continue
-                session.sendPacket(PacketOutUpdateLight(chunk))
-                session.sendPacket(PacketOutChunkData(chunk))
+            server.worldManager.loadChunks(positionsToLoad).forEach { (_, value) ->
+                session.sendPacket(PacketOutUpdateLight(value))
+                session.sendPacket(PacketOutChunkData(value))
             }
         }
 
@@ -249,6 +255,8 @@ class SessionManager(private val server: KryptonServer) {
     fun handleDisconnection(session: Session) {
         if (session.currentState != PacketState.PLAY) return
 
+        GlobalScope.launch { server.eventBus.call(QuitEvent(session.player)) }
+
         val destroyPacket = PacketOutEntityDestroy(listOf(session.id))
         val infoPacket = PacketOutPlayerInfo(
             PlayerAction.REMOVE_PLAYER,
@@ -269,6 +277,7 @@ class SessionManager(private val server: KryptonServer) {
     }
 
     fun updateLatency(session: Session, latency: Int) {
+        session.latency = latency
         val infoPacket = PacketOutPlayerInfo(
             PlayerAction.UPDATE_LATENCY,
             listOf(PlayerInfo(latency, profile = session.profile))
@@ -281,6 +290,15 @@ class SessionManager(private val server: KryptonServer) {
 
     fun sendPackets(vararg packets: Packet, predicate: (Session) -> Boolean = { true }) {
         sessions.asSequence().filter(predicate).forEach { session -> packets.forEach(session::sendPacket) }
+    }
+
+    fun shutdown() {
+        if (sessions.isEmpty()) return
+        val disconnectPacket = PacketOutPlayDisconnect(translatable { key("multiplayer.disconnect.server_shutdown") })
+        sessions.forEach {
+            it.sendPacket(disconnectPacket)
+            it.disconnect()
+        }
     }
 
     companion object {

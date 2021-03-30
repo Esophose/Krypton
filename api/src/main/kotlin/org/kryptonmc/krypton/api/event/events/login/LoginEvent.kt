@@ -1,5 +1,7 @@
 package org.kryptonmc.krypton.api.event.events.login
 
+import net.kyori.adventure.extra.kotlin.translatable
+import net.kyori.adventure.text.Component
 import org.kryptonmc.krypton.api.event.CancellableEvent
 import java.net.InetSocketAddress
 import java.util.*
@@ -9,10 +11,22 @@ import java.util.*
  * a player object constructed for them (when the state has not moved into PLAY
  * yet)
  *
+ * @param username the username of the player logging in
+ * @param uuid the UUID of the player logging in
+ * @param address the address of the player logging in
  * @author Callum Seabrook
  */
 data class LoginEvent(
     val username: String,
     val uuid: UUID,
     val address: InetSocketAddress
-) : CancellableEvent()
+) : CancellableEvent() {
+
+    @Volatile
+    var cancelledReason: Component = translatable { key("multiplayer.disconnect.kicked") }
+
+    fun cancel(reason: Component) {
+        isCancelled = true
+        cancelledReason = reason
+    }
+}

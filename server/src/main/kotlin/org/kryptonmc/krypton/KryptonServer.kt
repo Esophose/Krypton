@@ -1,29 +1,31 @@
 package org.kryptonmc.krypton
 
-import com.moandjiezana.toml.Toml
+import com.typesafe.config.ConfigFactory
 import kotlinx.coroutines.*
+import kotlinx.serialization.hocon.Hocon
+import kotlinx.serialization.hocon.decodeFromConfig
 import net.kyori.adventure.text.Component
-import net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer
 import org.kryptonmc.krypton.api.Server
+import org.kryptonmc.krypton.api.event.events.ticking.TickEndEvent
+import org.kryptonmc.krypton.api.event.events.ticking.TickStartEvent
 import org.kryptonmc.krypton.api.status.StatusInfo
 import org.kryptonmc.krypton.command.KryptonCommandManager
+import org.kryptonmc.krypton.concurrent.DefaultUncaughtExceptionHandler
 import org.kryptonmc.krypton.config.KryptonConfig
-import org.kryptonmc.krypton.config.ServerConfig
-import org.kryptonmc.krypton.config.StatusConfig
-import org.kryptonmc.krypton.config.WorldConfig
-import org.kryptonmc.krypton.encryption.Encryption
-import org.kryptonmc.krypton.extension.logger
-import org.kryptonmc.krypton.packet.PacketLoader
-import org.kryptonmc.krypton.registry.RegistryManager
-import org.kryptonmc.krypton.registry.tags.TagManager
-import org.kryptonmc.krypton.session.SessionManager
-import org.kryptonmc.krypton.api.world.Difficulty
-import org.kryptonmc.krypton.api.world.Gamemode
-import org.kryptonmc.krypton.console.ConsoleScope
 import org.kryptonmc.krypton.console.ConsoleSender
+import org.kryptonmc.krypton.console.KryptonConsole
+import org.kryptonmc.krypton.encryption.Encryption
 import org.kryptonmc.krypton.entity.entities.KryptonPlayer
 import org.kryptonmc.krypton.event.KryptonEventBus
+import org.kryptonmc.krypton.extension.logger
+import org.kryptonmc.krypton.packet.PacketLoader
+import org.kryptonmc.krypton.packet.out.play.PacketOutTimeUpdate
+import org.kryptonmc.krypton.packet.state.PacketState
 import org.kryptonmc.krypton.plugin.KryptonPluginManager
+import org.kryptonmc.krypton.registry.RegistryManager
+import org.kryptonmc.krypton.registry.tags.TagManager
+import org.kryptonmc.krypton.scheduling.KryptonScheduler
+import org.kryptonmc.krypton.session.SessionManager
 import org.kryptonmc.krypton.world.KryptonWorldManager
 import org.kryptonmc.krypton.world.scoreboard.KryptonScoreboard
 import java.io.File
@@ -33,7 +35,9 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.security.SecureRandom
 import java.util.*
-import kotlin.system.exitProcess
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import kotlin.system.measureTimeMillis
 
 class KryptonServer : Server {
 
@@ -55,6 +59,8 @@ class KryptonServer : Server {
     override fun player(uuid: UUID) = players.firstOrNull { it.uuid == uuid }
     override fun player(name: String) = players.firstOrNull { it.name == name }
 
+    override val console = ConsoleSender(this)
+
     override var scoreboard: KryptonScoreboard? = null
 
     internal val encryption = Encryption()
@@ -68,28 +74,44 @@ class KryptonServer : Server {
 
     override val worldManager = KryptonWorldManager(this, config.world)
 
-    override val commandManager = KryptonCommandManager()
+    override val commandManager = KryptonCommandManager(this)
     override val eventBus = KryptonEventBus()
+
+    override val scheduler = KryptonScheduler
 
     override lateinit var pluginManager: KryptonPluginManager
 
-    fun start() = runBlocking(Dispatchers.IO) {
+    @Volatile
+    internal var lastTickTime = 0L
+    private var lastOverloadWarning = 0L
+    private var tickCount = 0
+
+    private val tickScheduler = Executors.newSingleThreadScheduledExecutor()
+
+    @Volatile
+    internal var isRunning = true
+
+    fun start() {
         LOGGER.info("Starting Krypton server on ${config.server.ip}:${config.server.port}...")
         val startTime = System.nanoTime()
 
-        ConsoleScope.launch {
+        Thread {
             LOGGER.debug("Starting console handler")
-            while (true) {
-                val line = readLine() ?: continue
-                commandManager.dispatch(CONSOLE_SENDER, line)
-            }
-        }
+            KryptonConsole(this@KryptonServer).start()
+        }.apply {
+            name = "Console Handler"
+            uncaughtExceptionHandler = DefaultUncaughtExceptionHandler(logger("CONSOLE"))
+            isDaemon = true
+        }.start()
 
         LOGGER.debug("Loading packets...")
         PacketLoader.loadAll()
 
+        LOGGER.debug("Registering built-in commands...")
+        commandManager.registerBuiltins()
+
         LOGGER.debug("Starting Netty...")
-        val nettyJob = GlobalScope.launch(Dispatchers.IO) {
+        GlobalScope.launch(Dispatchers.IO) {
             nettyProcess.run()
         }
 
@@ -97,25 +119,61 @@ class KryptonServer : Server {
             LOGGER.warn("-----------------------------------------------------------------------------------")
             LOGGER.warn("SERVER IS IN OFFLINE MODE! THIS SERVER WILL MAKE NO ATTEMPTS TO AUTHENTICATE USERS!")
             LOGGER.warn("While this may allow players without full Minecraft accounts to connect, it also allows hackers to connect with any username they choose! Beware!")
-            LOGGER.warn("To get rid of this message, change online_mode to true in config.toml")
+            LOGGER.warn("To get rid of this message, change online-mode to true in config.conf")
             LOGGER.warn("-----------------------------------------------------------------------------------")
         }
 
         GlobalScope.launch(Dispatchers.IO) {
             LOGGER.info("Loading plugins...")
             pluginManager = KryptonPluginManager(this@KryptonServer)
+            pluginManager.initialise()
             LOGGER.info("Plugin loading done!")
             LOGGER.info("Done (${"%.3fs".format(Locale.ROOT, (System.nanoTime() - startTime) / 1.0E9)})! Type \"help\" for help.")
         }
 
+        lastTickTime = System.currentTimeMillis()
+        if (config.server.tickThreshold > 0) WatchdogProcess(this@KryptonServer).start()
+
         Runtime.getRuntime().addShutdownHook(Thread({
             LOGGER.info("Stopping Krypton...")
+            isRunning = false
             LOGGER.info("Shutting down plugins...")
             pluginManager.shutdown()
+            eventBus.unregisterAll()
+
+            // shut down schedulers and disconnect players
+            scheduler.shutdown()
+            tickScheduler.shutdownNow()
+            sessionManager.shutdown()
             LOGGER.info("Goodbye")
         }, "Shutdown Handler"))
 
-        nettyJob.join()
+        tickScheduler.scheduleAtFixedRate({
+            val nextTickTime = System.currentTimeMillis() - lastTickTime
+            if (nextTickTime > 2000L && lastTickTime - lastOverloadWarning >= 15000L) {
+                LOGGER.warn("Woah there! Can't keep up! Running ${nextTickTime}ms (${nextTickTime / 50} ticks) behind!")
+                lastOverloadWarning = lastTickTime
+            }
+            eventBus.call(TickStartEvent(tickCount))
+            val tickTime = measureTimeMillis(::tick)
+            val finishTime = System.currentTimeMillis()
+            eventBus.call(TickEndEvent(tickCount, tickTime, finishTime))
+            lastTickTime = finishTime
+        }, 0, TICK_INTERVAL, TimeUnit.MILLISECONDS)
+    }
+
+    private fun tick() {
+        tickCount++
+        worldManager.worlds.forEach { (_, world) ->
+            if (tickCount % 20 == 0) {
+                val timePacket = PacketOutTimeUpdate(world.time, world.dayTime)
+                sessionManager.sessions.asSequence()
+                    .filter { it.currentState == PacketState.PLAY }
+                    .filter { it.player.world == world }
+                    .forEach { it.sendPacket(timePacket) }
+            }
+            world.tick()
+        }
     }
 
     override fun broadcast(message: Component, permission: String?) {
@@ -126,57 +184,14 @@ class KryptonServer : Server {
     override fun audiences() = players
 
     private fun loadConfig(): KryptonConfig {
-        val configFile = File(Path.of("").toAbsolutePath().toFile(), "config.toml")
+        val configFile = File(CURRENT_DIRECTORY, "config.conf")
         if (!configFile.exists()) {
-            val inputStream = Thread.currentThread().contextClassLoader.getResourceAsStream("config.toml")
+            val inputStream = Thread.currentThread().contextClassLoader.getResourceAsStream("config.conf")
                 ?: throw IOException("Config file not in classpath! Something has gone horribly wrong!")
             Files.copy(inputStream, configFile.toPath())
         }
 
-        val toml = Toml().read(configFile)
-        val serverConfig = toml.getTable("server")
-        val statusConfig = toml.getTable("status")
-        val worldConfig = toml.getTable("world")
-
-        val gamemode = if (worldConfig.toMap()["gamemode"] is Long) {
-            Gamemode.fromId(worldConfig.getLong("gamemode").toInt())
-        } else {
-            Gamemode.valueOf(worldConfig.getString("gamemode").toUpperCase())
-        }
-        val difficulty = if (worldConfig.toMap()["difficulty"] is Long) {
-            Difficulty.fromId(worldConfig.getLong("difficulty").toInt())
-        } else {
-            Difficulty.valueOf(worldConfig.getString("difficulty").toUpperCase())
-        }
-
-        if (gamemode == null) {
-            LOGGER.error("Invalid gamemode! Could not parse value ${worldConfig.getString("gamemode")}!")
-            exitProcess(0)
-        }
-        if (difficulty == null) {
-            LOGGER.error("Invalid difficulty! Could not parse value ${worldConfig.getString("difficulty")}!")
-            exitProcess(0)
-        }
-
-        return KryptonConfig(
-            ServerConfig(
-                serverConfig.getString("ip"),
-                serverConfig.getLong("port").toInt(),
-                serverConfig.getBoolean("online_mode"),
-                serverConfig.getLong("compression_threshold").toInt()
-            ),
-            StatusConfig(
-                LegacyComponentSerializer.legacyAmpersand().deserialize(statusConfig.getString("motd")),
-                statusConfig.getLong("max_players").toInt()
-            ),
-            WorldConfig(
-                worldConfig.getString("name"),
-                gamemode,
-                difficulty,
-                worldConfig.getBoolean("hardcore"),
-                worldConfig.getLong("view_distance").toInt()
-            )
-        )
+        return HOCON.decodeFromConfig(ConfigFactory.parseFile(configFile))
     }
 
     object KryptonServerInfo : Server.ServerInfo {
@@ -196,8 +211,8 @@ class KryptonServer : Server {
 
     companion object {
 
-        private val CONSOLE_SENDER = ConsoleSender()
-
+        private const val TICK_INTERVAL = 1000L / 20L // milliseconds in a tick
+        private val HOCON = Hocon {}
         private val LOGGER = logger<KryptonServer>()
     }
 }
@@ -206,3 +221,5 @@ data class KryptonStatusInfo(
     override val maxPlayers: Int,
     override val motd: Component
 ) : StatusInfo
+
+val CURRENT_DIRECTORY: File = Path.of("").toAbsolutePath().toFile()

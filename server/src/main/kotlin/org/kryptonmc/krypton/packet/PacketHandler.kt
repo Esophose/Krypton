@@ -1,7 +1,5 @@
 package org.kryptonmc.krypton.packet
 
-import kotlinx.coroutines.GlobalScope
-import kotlinx.coroutines.launch
 import net.kyori.adventure.audience.MessageType
 import net.kyori.adventure.extra.kotlin.text
 import net.kyori.adventure.extra.kotlin.translatable
@@ -14,6 +12,8 @@ import org.kryptonmc.krypton.api.event.events.handshake.HandshakeEvent
 import org.kryptonmc.krypton.api.event.events.login.LoginEvent
 import org.kryptonmc.krypton.api.event.events.play.ChatEvent
 import org.kryptonmc.krypton.api.event.events.play.ClientSettingsEvent
+import org.kryptonmc.krypton.api.event.events.play.MoveEvent
+import org.kryptonmc.krypton.api.event.events.play.PluginMessageEvent
 import org.kryptonmc.krypton.api.world.Location
 import org.kryptonmc.krypton.auth.GameProfile
 import org.kryptonmc.krypton.auth.exceptions.AuthenticationException
@@ -73,11 +73,13 @@ class PacketHandler(private val sessionManager: SessionManager, private val serv
             is PacketInAnimation -> handleAnimation(session, packet)
             is PacketInTeleportConfirm -> Unit // we can ignore this for now
             is PacketInEntityAction -> handleEntityAction(session, packet)
+            is PacketInPluginMessage -> handlePluginMessage(session, packet)
+            is PacketInTabComplete -> handleTabComplete(session, packet)
         }
     }
 
     private fun handleHandshake(session: Session, packet: PacketInHandshake) {
-        GlobalScope.launch { server.eventBus.call(HandshakeEvent(session.channel.remoteAddress() as InetSocketAddress)) }
+        server.eventBus.call(HandshakeEvent(session.channel.remoteAddress() as InetSocketAddress))
         when (val nextState = packet.data.nextState) {
             PacketState.LOGIN -> {
                 session.currentState = PacketState.LOGIN
@@ -113,6 +115,7 @@ class PacketHandler(private val sessionManager: SessionManager, private val serv
             packet.settings.chatColors,
             packet.settings.skinSettings
         )
+        server.eventBus.call(event)
 
         session.settings = packet.settings
         session.sendPacket(PacketOutEntityMetadata(
@@ -140,7 +143,7 @@ class PacketHandler(private val sessionManager: SessionManager, private val serv
     }
 
     private fun handleLoginStart(session: Session, packet: PacketInLoginStart) {
-        session.player = KryptonPlayer(session, session.channel.remoteAddress() as InetSocketAddress)
+        session.player = KryptonPlayer(server, session, session.channel.remoteAddress() as InetSocketAddress)
         session.player.name = packet.name
 
         if (!server.config.server.onlineMode) {
@@ -151,7 +154,7 @@ class PacketHandler(private val sessionManager: SessionManager, private val serv
             val event = LoginEvent(packet.name, offlineUUID, session.channel.remoteAddress() as InetSocketAddress)
             server.eventBus.call(event)
             if (event.isCancelled) {
-                session.sendPacket(PacketOutDisconnect(translatable { key("multiplayer.disconnect.kicked") }))
+                session.sendPacket(PacketOutDisconnect(event.cancelledReason))
                 session.disconnect()
                 return
             }
@@ -197,6 +200,7 @@ class PacketHandler(private val sessionManager: SessionManager, private val serv
         if (newLocation == oldLocation) return
 
         session.player.location = newLocation
+        server.eventBus.call(MoveEvent(session.player, oldLocation, newLocation))
 
         val positionPacket = PacketOutEntityPosition(
             session.id,
@@ -231,6 +235,7 @@ class PacketHandler(private val sessionManager: SessionManager, private val serv
         if (newLocation == oldLocation) return
 
         session.player.location = newLocation
+        server.eventBus.call(MoveEvent(session.player, oldLocation, newLocation))
 
         val positionAndRotationPacket = PacketOutEntityPositionAndRotation(
             session.id,
@@ -281,6 +286,12 @@ class PacketHandler(private val sessionManager: SessionManager, private val serv
         }
     }
 
+    private fun handleTabComplete(session: Session, packet: PacketInTabComplete) {
+        server.commandManager.suggest(session.player, packet.text.removePrefix("/")).thenAccept {
+            session.sendPacket(PacketOutTabComplete(packet.id, it))
+        }
+    }
+
     private fun handleKeepAlive(session: Session, packet: PacketInKeepAlive) {
         if (session.lastKeepAliveId == packet.keepAliveId) {
             sessionManager.updateLatency(session, max((packet.keepAliveId - session.lastKeepAliveId), 0L).toInt())
@@ -319,6 +330,10 @@ class PacketHandler(private val sessionManager: SessionManager, private val serv
         sessionManager.sendPackets(metadataPacket) {
             it != session && it.currentState == PacketState.PLAY
         }
+    }
+
+    private fun handlePluginMessage(session: Session, packet: PacketInPluginMessage) {
+        server.eventBus.call(PluginMessageEvent(session.player, packet.channel, packet.data.decodeToString()))
     }
 
     companion object {

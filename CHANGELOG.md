@@ -4,6 +4,138 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.1] - 2021-03-27
+### Added
+- Players now have a `World`, which is the world they are currently in.
+
+### Changed
+- Fixed time update packets not filtering by world, meaning worlds could send time packets to
+  players in other worlds
+- Moved packet state change below world and location initialisation to avoid the chance that
+  the variable could not be initialised when we access it in the ticking mechanism.
+
+## [0.15] - 2021-03-27
+### Added
+- Time ticking (the server now sends out a time update packet every second, and the time is
+  updated every tick). This is the start of ticking for Krypton.
+- Watchdog thread, to make sure the tick thread doesn't die. The threshold for what this thread
+  considers "death" is configurable in the main configuration
+- Suggestion support (tab completion)
+- Warning when memory is 512 MB or below (vanilla threshold)
+- Built-in stop command to stop the server.
+- Vanilla's two uncaught exception handlers, to catch and log exceptions from threads that throw
+  exceptions in execution.
+
+### Changed
+- Updated `CommandManager`'s `register` functions that take Brigadier types to accept nodes
+  instead of builders
+- `Sender` is now identified (extends `Identified`, meaning it has an `Identity`, or a UUID)
+- `WorldBorder` now has a `World` property again.
+- Overrode permission checks for the console to force them to always succeed, as we are god
+  and permission checks are for peasants :)
+- Added `unregisterAll` function to the event bus, to allow
+- Properly disconnect all connected players when the server stops.
+
+## [0.14.1] - 2021-03-24
+### Changed
+- Fixed Krypton JAR not working properly due to the `Log4J2Plugins.dat` file not being merged from
+  Log4J 2 and Minecrell's TerminalConsoleAppender (see [here](https://github.com/Minecrell/TerminalConsoleAppender/issues/15))
+- Changed log level of world loading to INFO to allow it to be seen in production (not that
+  Krypton is production ready yet though)
+
+## [0.14] - 2021-03-21
+### Added
+- Support for more of Adventure's `Audience` methods, such as `sendActionBar`,
+  `sendPlayerListHeaderAndFooter`, `showTitle`, `clearTitle` and `resetTitle`
+- Better documentation for some of the `data class`es in the API by using `@param` to describe
+  their constructor parameters
+- Default parameter for `title` in the `PacketOutTitle` packet to allow us to send action bars
+  without having to provide an empty title ourselves (the title isn't sent anyway if we use the
+  set action bar `TitleAction`)
+
+### Changed
+- Fixed issue with player joining loading so many chunks that you would find over 50,000 sections
+  and around 7-10 million `Long`s being allocated on the heap by only having the server load the
+  chunks required by the client.
+- Config file format is now HOCON instead of TOML.
+- Errors with plugin loading and instantiation are now better handled and better described.
+- `PacketOutAbilities` now uses the API `Abilities` class rather than the internal one.
+- The metadata writing functions now have a shared constant for the ending index `0xFF`
+- Cleaned up the `KryptonEventBus` to remove an unnecessary `do while` and replace it with a `for`,
+  also cleaned up a few things that were remnants of messy Java code.
+- Switched to Gradle's Kotlin DSL.
+
+### Removed
+- Removed `id` properties from enums where their values were the same as the `ordinal`, to preserve
+  very minor memory space (micro optimisation I know)
+- Removed internal `Abilities` class (replaced with API one)
+
+## [0.13.9] - 2021-03-21
+### Added
+- Terminal console appender, to add support for legacy section formatting codes in the console
+- Serialisers for all of Brigadier's argument type parsers
+
+### Changed
+- Fixed issue with arguments not being registered in the Brigadier argument builders when commands
+  were registered, and so commands with more than just the initial command were not being parsed.
+- Permission check event only firing when a command performs a permission check when it needs to be
+  fired every time `hasPermission` is called
+- Better handling of `CommandSyntaxException`s from Brigadier, meaning you now better see what is
+  actually wrong with the command you typed.
+- Fixed issues with the scheduler not shutting down properly (causing the plugin manager to never be
+  able to shut down plugins either) due to a `ConcurrentModificationException` as I was not using a
+  `ConcurrentHashMap` and `KeySetView` (`ConcurrentHashMap.newKeySet()`) for storing tasks.
+
+## [0.13.8] - 2021-03-20
+### Changed
+- Made locale a nullable var rather than a lateinit var to avoid issues where it would not be set and
+  a plugin would attempt to access it, resulting in an error.
+
+## [0.13.7] - 2021-03-20
+### Added
+- Console's sender object is now exposed to the API
+
+## [0.13.6] - 2021-03-20
+### Added
+- Ability to manipulate permission checks (change the result of them)
+
+## [0.13.5] - 2021-03-20
+### Added
+- Quit event (no, it can't be cancelled)
+
+## [0.13.4] - 2021-03-20
+### Added
+- Permission check event, which is fired every time a permission check is made.
+
+### Changed
+- Permissions are now mapped to boolean values, to allow for them to be tristate (true, false or unset).
+
+## [0.13.3] - 2021-03-20
+### Changed
+- Priority values are now bytes to avoid confusion because the event bus ignores any values outside the
+  range of a byte
+
+## [0.13.2] - 2021-03-20
+### Changed
+- Priorities are now in the correct order (MAXIMUM first, NONE last)
+
+## [0.13.1] - 2021-03-20
+### Added
+- Calling of the PluginMessageEvent and MoveEvent
+- Optional reason for cancellation for the login and join events (defaults to the Mojang default)
+- Latency update packet to the login sequence, as denoted in https://wiki.vg/Protocol_FAQ#What.27s_the_normal_login_sequence_for_a_client.3F
+
+### Changed
+- For now, MoveEvent is no longer cancellable, as I do not want to cause any issues.
+
+## [0.13] - 2021-03-19
+### Added
+- Simple scheduling using an executor service.
+
+## [0.12.1] - 2021-03-19
+### Added
+- Support for appending URLs to plugins' class loaders at runtime.
+
 ## [0.12] - 2021-03-12
 ### Added
 - Cancellable event support using a BungeeCord-style event bus.
